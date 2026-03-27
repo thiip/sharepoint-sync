@@ -58,9 +58,14 @@ def parse_sheet(wb, name):
     for i, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=1):
         if not any(row): continue
         d = row[0]
-        if hasattr(d, 'strftime'): d = d.strftime('%Y-%m-%d')
-        elif d: d = str(d)
-        else: d = None
+        if hasattr(d, 'strftime'):
+            d = d.strftime('%Y-%m-%d')
+        elif d is not None:
+            d = str(d).strip()
+            if not d:
+                d = '1970-01-01'
+        else:
+            d = '1970-01-01'
         v = row[4] if len(row) > 4 else 0
         try: v = float(v or 0)
         except: v = 0
