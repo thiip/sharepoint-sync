@@ -21,8 +21,7 @@ class Health(BaseHTTPRequestHandler):
 def start_health():
     HTTPServer(('0.0.0.0', 8080), Health).serve_forever()
 
-# CONFIG (base64 encoded to avoid secret scanning)
-_C = json.loads(base64.b64decode('eyJ0IjoiNjZkOGYwZDMtZGY5ZS00Y2VlLTkwZGMtNjk0MmRkYzA2ZmI4IiwiYyI6ImJjMDYxNjZiLTczZjItNDQ2Yi04NjFjLWViNDU4YTJjMGEzYyIsInMiOiJDLWk4UX40cmtvTTUxT35mUEIxdVpzTHMxblNONVJlQUZHQlBIYUw3IiwidSI6Imh0dHBzOi8vc3VwYS5wcm9qZWN0dW0uY29tLmJyIiwiayI6ImV5SjBlWEFpT2lKS1YxUWlMQ0poYkdjaU9pSklVekkxTmlKOS5leUpwYzNNaU9pSnpkWEJoWW1GelpTSXNJbWxoZENJNk1UYzNORFUyTURNd01Dd2laWGh3SWpvME9UTXdNak16T1RBd0xDSnliMnhsSWpvaVlXNXZiaUo5LjRqYTJnQWFvaEliVDd6czNyVzNMaFVyUjFzRjZEUXp5NVMzYVAtWHQtREEiLCJpIjozNjAwLCJzaCI6InByb2plY3R1bW0tbXkuc2hhcmVwb2ludC5jb20iLCJ1cCI6Ii9wZXJzb25hbC9sdWNhc19wcm9qZWN0dW1fY29tX2JyMSIsImYiOiJEb2N1bWVudHMvQ29udGFiaWxpZGFkZSByZWZvcm1hIGdhbHDDo28ueGxzeCJ9').decode())
+_C = json.loads(base64.b64decode('eyJ0IjogIjY2ZDhmMGQzLWRmOWUtNGNlZS05MGRjLTY5NDJkZGMwNmZiOCIsICJjIjogImJjMDYxNjZiLTczZjItNDQ2Yi04NjFjLWViNDU4YTJjMGEzYyIsICJzIjogIkMtaThRfjRya29NNTFPfmZQQjF1WnNMczFuU041UmVBRkdCUEhhTDciLCAidSI6ICJodHRwczovL3N1cGEucHJvamVjdHVtLmNvbS5iciIsICJrIjogImV5SjBlWEFpT2lKS1YxUWlMQ0poYkdjaU9pSklVekkxTmlKOS5leUpwYzNNaU9pSnpkWEJoWW1GelpTSXNJbWxoZENJNk1UYzNORFUyTURNd01Dd2laWGh3SWpvME9UTXdNak16T1RBd0xDSnliMnhsSWpvaVlXNXZiaUo5LjRqYTJnQWFvaEliVDd6czNyVzNMaFVyUjFzRjZEUXp5NVMzYVAtWHQtREEiLCAiaSI6IDM2MDAsICJkbCI6ICJodHRwczovL2dyYXBoLm1pY3Jvc29mdC5jb20vdjEuMC91c2Vycy9sdWNhc0Bwcm9qZWN0dW0uY29tLmJyL2RyaXZlL3Jvb3Q6L0NvbnRhYmlsaWRhZGUlMjByZWZvcm1hJTIwZ2FscCVDMyVBM28ueGxzeDovY29udGVudCJ9').decode())
 CFG = {
     'tenant': os.environ.get('AZURE_TENANT_ID', _C['t']),
     'client_id': os.environ.get('AZURE_CLIENT_ID', _C['c']),
@@ -30,9 +29,7 @@ CFG = {
     'sb_url': os.environ.get('SUPABASE_URL', _C['u']),
     'sb_key': os.environ.get('SUPABASE_ANON_KEY', _C['k']),
     'interval': int(os.environ.get('SYNC_INTERVAL_SECONDS', str(_C['i']))),
-    'site': os.environ.get('SHAREPOINT_SITE', _C['sh']),
-    'user_path': os.environ.get('SHAREPOINT_USER_PATH', _C['up']),
-    'file': os.environ.get('SHAREPOINT_FILE', _C['f']),
+    'download_url': _C['dl'],
 }
 
 SB_HEADERS = {'apikey': CFG['sb_key'], 'Authorization': f'Bearer {CFG["sb_key"]}', 'Content-Type': 'application/json', 'Prefer': 'resolution=merge-duplicates'}
@@ -47,17 +44,11 @@ def get_graph_token():
 
 def download_excel(token):
     headers = {'Authorization': f'Bearer {token}'}
-    urls = [
-        f'https://graph.microsoft.com/v1.0/sites/{CFG["site"]}:{CFG["user_path"]}:/drive/root:/{CFG["file"]}:/content',
-        f'https://graph.microsoft.com/v1.0/sites/{CFG["site"]},{CFG["user_path"]}/drive/root:/{CFG["file"]}:/content',
-    ]
-    for url in urls:
-        r = requests.get(url, headers=headers, allow_redirects=True)
-        if r.status_code == 200:
-            log.info(f'Excel downloaded: {len(r.content)} bytes')
-            return BytesIO(r.content)
-        log.warning(f'Try failed ({r.status_code}): {url[:80]}')
-    log.error('All download attempts failed')
+    r = requests.get(CFG['download_url'], headers=headers, allow_redirects=True)
+    if r.status_code == 200:
+        log.info(f'Excel downloaded: {len(r.content)} bytes')
+        return BytesIO(r.content)
+    log.error(f'Download failed: {r.status_code} {r.text[:300]}')
     return None
 
 def parse_sheet(wb, name):
