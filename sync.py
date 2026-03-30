@@ -385,10 +385,10 @@ def parse_excel(content):
                     continue
 
                 despesas.append({
-                    "descricao": str(ws.cell(row=row, column=2).value or ""),
-                    "obs": str(ws.cell(row=row, column=3).value or ""),
+                    "descricao": str(ws.cell(row=row, column=2).value or "").strip().upper(),
+                    "obs": str(ws.cell(row=row, column=3).value or "").strip(),
                     "data": data_str,
-                    "pago": str(ws.cell(row=row, column=5).value or ""),
+                    "pago": str(ws.cell(row=row, column=5).value or "").strip(),
                     "valor": valor,
                 })
 
@@ -441,26 +441,113 @@ def parse_excel(content):
     return despesas, outros
 
 # === SYNC TO SUPABASE ===
-def sync_to_supabase(despesas, outros):
-    if despesas:
-        resp = requests.post(
-            f"{SUPABASE_URL}/rest/v1/rpc/sync_despesas",
-            headers=HEADERS_SB,
-            json={"payload": despesas},
-        )
-        log.info(f"Supabase sync_despesas: {resp.status_code} ({len(despesas)} rows)")
-        if resp.status_code >= 400:
-            log.error(f"  Error: {resp.text[:300]}")
+def _norm(s):
+    """Normalize string for comparison: uppercase + strip whitespace."""
+    return str(s or "").strip().upper()
 
-    if outros:
-        resp = requests.post(
-            f"{SUPABASE_URL}/rest/v1/rpc/sync_outros",
+def sync_to_supabase(despesas, outros):
+    # ── DESPESAS ──────────────────────────────────────────────────────────────
+    if despesas:
+        # 1. Fetch all existing records
+        resp = requests.get(
+            f"{SUPABASE_URL}/rest/v1/despesas?select=id,descricao,data,valor,pago&source=eq.excel",
             headers=HEADERS_SB,
-            json={"payload": outros},
         )
-        log.info(f"Supabase sync_outros: {resp.status_code} ({len(outros)} rows)")
-        if resp.status_code >= 400:
-            log.error(f"  Error: {resp.text[:300]}")
+        existing = resp.json() if resp.status_code == 200 else []
+
+        # Build two lookup maps from existing records
+        # exact_map: (desc_norm, data, valor_str, pago_norm) → id
+        # txn_map:   (data, valor_str, pago_norm)            → [id, ...]
+        exact_map = {}
+        txn_map = {}
+        for e in existing:
+            desc_n = _norm(e["descricao"])
+            pago_n = _norm(e["pago"])
+            v_str  = str(round(float(e["valor"]), 2))
+            exact_map[(desc_n, e["data"], v_str, pago_n)] = e["id"]
+            txn_key = (e["data"], v_str, pago_n)
+            txn_map.setdefault(txn_key, []).append(e["id"])
+
+        to_insert = []
+        for d in despesas:
+            desc_n = _norm(d["descricao"])
+            pago_n = _norm(d["pago"])
+            v_str  = str(round(float(d["valor"]), 2))
+            exact_key = (desc_n, d["data"], v_str, pago_n)
+            txn_key   = (d["data"], v_str, pago_n)
+
+            if exact_key in exact_map:
+                # Already exists with same normalized name — skip
+                continue
+
+            if txn_key in txn_map and len(txn_map[txn_key]) == 1:
+                # Same transaction exists but with a different name (capitalisation /
+                # abbreviation changed in the spreadsheet) — rename the existing record
+                existing_id = txn_map[txn_key][0]
+                r = requests.patch(
+                    f"{SUPABASE_URL}/rest/v1/despesas?id=eq.{existing_id}",
+                    headers=HEADERS_SB,
+                    json={"descricao": desc_n},
+                )
+                if r.status_code < 300:
+                    log.info(f"  Renamed ID={existing_id} → {desc_n}")
+                else:
+                    log.error(f"  Rename failed ID={existing_id}: {r.status_code}")
+                # Update lookup so a second record with same txn_key isn't double-inserted
+                exact_map[exact_key] = existing_id
+                continue
+
+            # Genuinely new record
+            d["descricao"] = desc_n
+            d["pago"]      = d["pago"].strip()
+            d["source"]    = "excel"
+            to_insert.append(d)
+
+        if to_insert:
+            r = requests.post(
+                f"{SUPABASE_URL}/rest/v1/despesas",
+                headers={**HEADERS_SB, "Prefer": "return=minimal"},
+                json=to_insert,
+            )
+            log.info(f"Inserted {len(to_insert)} new despesas: {r.status_code}")
+            if r.status_code >= 400:
+                log.error(f"  Error: {r.text[:300]}")
+        else:
+            log.info("Despesas: no new records to insert")
+
+    # ── OUTROS ────────────────────────────────────────────────────────────────
+    if outros:
+        resp = requests.get(
+            f"{SUPABASE_URL}/rest/v1/outros?select=id,cat,data,valor",
+            headers=HEADERS_SB,
+        )
+        existing_outros = resp.json() if resp.status_code == 200 else []
+
+        # exact_map: (cat_norm, data, valor_str) → id
+        outros_exact = {}
+        for e in existing_outros:
+            key = (_norm(e["cat"]), e["data"], str(round(float(e["valor"]), 2)))
+            outros_exact[key] = e["id"]
+
+        to_insert_outros = []
+        for o in outros:
+            key = (_norm(o["cat"]), o["data"], str(round(float(o["valor"]), 2)))
+            if key in outros_exact:
+                continue
+            o["source"] = "excel"
+            to_insert_outros.append(o)
+
+        if to_insert_outros:
+            r = requests.post(
+                f"{SUPABASE_URL}/rest/v1/outros",
+                headers={**HEADERS_SB, "Prefer": "return=minimal"},
+                json=to_insert_outros,
+            )
+            log.info(f"Inserted {len(to_insert_outros)} new outros: {r.status_code}")
+            if r.status_code >= 400:
+                log.error(f"  Error: {r.text[:300]}")
+        else:
+            log.info("Outros: no new records to insert")
 
 # === MAIN ===
 def run_sync():
@@ -526,4 +613,3 @@ if __name__ == "__main__":
     while True:
         schedule.run_pending()
         time.sleep(60)
-# Bidirectional sync v1.0
