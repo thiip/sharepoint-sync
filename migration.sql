@@ -10,6 +10,7 @@ UPDATE despesas SET source = 'excel' WHERE source IS NULL;
 UPDATE outros SET source = 'excel' WHERE source IS NULL;
 
 -- 3. Atualizar RPC sync_despesas para não sobrescrever itens do ERP
+-- Match usa UPPER(TRIM()) para evitar duplicatas por variação de capitalização
 CREATE OR REPLACE FUNCTION sync_despesas(payload JSONB)
 RETURNS void AS $$
 DECLARE
@@ -18,30 +19,43 @@ DECLARE
 BEGIN
   FOR item IN SELECT * FROM jsonb_array_elements(payload)
   LOOP
-    -- Tentar encontrar registro existente por descricao + data + valor
+    -- Match por data + valor + pago (case-insensitive) — identifica a transação
+    -- Depois tenta refinar por descricao normalizado
     SELECT id INTO matched_id
     FROM despesas
-    WHERE descricao = item->>'descricao'
-      AND data = item->>'data'
+    WHERE data = item->>'data'
       AND valor = (item->>'valor')::NUMERIC
+      AND UPPER(TRIM(pago)) = UPPER(TRIM(item->>'pago'))
+      AND UPPER(TRIM(descricao)) = UPPER(TRIM(item->>'descricao'))
     LIMIT 1;
 
+    IF matched_id IS NULL THEN
+      -- Fallback: mesma transação (data+valor+pago) mas nome diferente
+      SELECT id INTO matched_id
+      FROM despesas
+      WHERE data = item->>'data'
+        AND valor = (item->>'valor')::NUMERIC
+        AND UPPER(TRIM(pago)) = UPPER(TRIM(item->>'pago'))
+      LIMIT 1;
+    END IF;
+
     IF matched_id IS NOT NULL THEN
-      -- Atualizar apenas se não foi modificado pelo ERP
+      -- Atualizar registro existente (nome, obs, pago) se não é do ERP
       UPDATE despesas
-      SET obs = item->>'obs',
-          pago = item->>'pago',
+      SET descricao = UPPER(TRIM(item->>'descricao')),
+          obs = TRIM(item->>'obs'),
+          pago = TRIM(item->>'pago'),
           source = 'excel'
       WHERE id = matched_id
         AND source != 'erp';
     ELSE
-      -- Inserir novo registro vindo do Excel
+      -- Inserir novo registro vindo do Excel (já normalizado)
       INSERT INTO despesas (descricao, obs, data, pago, valor, source)
       VALUES (
-        item->>'descricao',
-        item->>'obs',
+        UPPER(TRIM(item->>'descricao')),
+        TRIM(item->>'obs'),
         item->>'data',
-        item->>'pago',
+        TRIM(item->>'pago'),
         (item->>'valor')::NUMERIC,
         'excel'
       );
@@ -61,7 +75,7 @@ BEGIN
   LOOP
     SELECT id INTO matched_id
     FROM outros
-    WHERE cat = item->>'cat'
+    WHERE UPPER(TRIM(cat)) = UPPER(TRIM(item->>'cat'))
       AND data = item->>'data'
       AND valor = (item->>'valor')::NUMERIC
     LIMIT 1;
@@ -74,7 +88,7 @@ BEGIN
     ELSE
       INSERT INTO outros (cat, data, valor, source)
       VALUES (
-        item->>'cat',
+        TRIM(item->>'cat'),
         item->>'data',
         (item->>'valor')::NUMERIC,
         'excel'
