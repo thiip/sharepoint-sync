@@ -479,22 +479,21 @@ def parse_excel(content):
     log.info(f"Parsed: {len(despesas)} despesas, {len(outros)} outros")
     return despesas, outros
 
-# === SYNC TO SUPABASE (FIXED) ===
+# === SYNC TO SUPABASE (COUNTER-BASED DEDUP) ===
 def sync_to_supabase(despesas, outros):
-    """Idempotent sync: repeated imports NEVER create duplicates.
+    """Idempotent sync using COUNTER-BASED dedup.
 
-    Key fixes vs previous version:
-    1. Fetches ALL source types (not just 'excel') for dedup
-    2. Uses Decimal for deterministic float comparison
-    3. Updates exact_map with newly inserted records to prevent intra-batch dupes
-    4. Uses robust normalization (_norm) with accent stripping
+    The Excel can have duplicate rows that are legitimate (e.g. two identical
+    payments on the same day). We count how many times each key exists in the
+    DB and in the incoming Excel batch. We only insert the DIFFERENCE.
+
+    This guarantees: DB record count per key == Excel row count per key.
     """
-    stats = {"inserted": 0, "skipped": 0, "renamed": 0, "errors": 0}
+    from collections import Counter
+    stats = {"inserted": 0, "skipped": 0, "errors": 0}
 
     # ── DESPESAS ──────────────────────────────────────────────────────────────
     if despesas:
-        # FIX #1: Fetch ALL existing records regardless of source
-        # Previously only checked source='excel', missing 'synced' and 'erp' records
         resp = requests.get(
             f"{SUPABASE_URL}/rest/v1/despesas?select=id,descricao,data,valor,pago,source"
             f"&source=neq.erp_deleted",
@@ -502,55 +501,45 @@ def sync_to_supabase(despesas, outros):
         )
         existing = resp.json() if resp.status_code == 200 else []
 
-        # Build lookup maps using Decimal for deterministic comparison
-        exact_map = {}
-        txn_map = {}
+        # Count existing records per key in DB
+        db_counts = Counter()
         for e in existing:
-            desc_n = _norm(e["descricao"])
-            pago_n = _norm(e["pago"])
-            v_str  = _norm_valor(e["valor"])  # FIX #2: Decimal-based comparison
-            exact_map[(desc_n, e["data"], v_str, pago_n)] = e["id"]
-            txn_key = (e["data"], v_str, pago_n)
-            txn_map.setdefault(txn_key, []).append(e["id"])
+            key = (_norm(e["descricao"]), e["data"], _norm_valor(e["valor"]),
+                   _norm(e["pago"]))
+            db_counts[key] += 1
 
-        to_insert = []
+        # Count incoming records per key from Excel
+        excel_counts = Counter()
+        excel_by_key = {}
         for d in despesas:
             desc_n = _norm(d["descricao"])
             pago_n = _norm(d["pago"])
             v_str  = _norm_valor(d["valor"])
-            exact_key = (desc_n, d["data"], v_str, pago_n)
-            txn_key   = (d["data"], v_str, pago_n)
+            key = (desc_n, d["data"], v_str, pago_n)
+            excel_counts[key] += 1
+            excel_by_key[key] = d  # keep one representative record per key
 
-            if exact_key in exact_map:
-                stats["skipped"] += 1
+        to_insert = []
+        for key, excel_count in excel_counts.items():
+            db_count = db_counts.get(key, 0)
+            needed = excel_count - db_count
+
+            if needed <= 0:
+                stats["skipped"] += excel_count
                 continue
 
-            if txn_key in txn_map and len(txn_map[txn_key]) == 1:
-                existing_id = txn_map[txn_key][0]
-                r = requests.patch(
-                    f"{SUPABASE_URL}/rest/v1/despesas?id=eq.{existing_id}",
-                    headers=HEADERS_SB,
-                    json={"descricao": desc_n},
-                )
-                if r.status_code < 300:
-                    log.info(f"  Renamed ID={existing_id} → {desc_n}")
-                    stats["renamed"] += 1
-                else:
-                    log.error(f"  Rename failed ID={existing_id}: {r.status_code}")
-                    stats["errors"] += 1
-                # FIX #3: Update map to prevent intra-batch duplicates
-                exact_map[exact_key] = existing_id
-                continue
-
-            # Genuinely new record
-            d["descricao"] = desc_n
-            d["pago"]      = d["pago"].strip()
-            d["source"]    = "excel"
-            to_insert.append(d)
-
-            # FIX #3: Register in maps immediately so next iteration sees it
-            exact_map[exact_key] = -1  # placeholder ID
-            txn_map.setdefault(txn_key, []).append(-1)
+            # Insert exactly 'needed' copies
+            d = excel_by_key[key]
+            for _ in range(needed):
+                to_insert.append({
+                    "descricao": key[0],
+                    "obs": d.get("obs", ""),
+                    "data": d["data"],
+                    "pago": d["pago"],
+                    "valor": d["valor"],
+                    "source": "excel",
+                })
+            stats["skipped"] += (excel_count - needed)
 
         if to_insert:
             r = requests.post(
@@ -569,7 +558,6 @@ def sync_to_supabase(despesas, outros):
 
     # ── OUTROS ────────────────────────────────────────────────────────────────
     if outros:
-        # FIX #1: Fetch ALL source types for dedup
         resp = requests.get(
             f"{SUPABASE_URL}/rest/v1/outros?select=id,cat,data,valor,source"
             f"&source=neq.erp_deleted",
@@ -577,20 +565,32 @@ def sync_to_supabase(despesas, outros):
         )
         existing_outros = resp.json() if resp.status_code == 200 else []
 
-        outros_exact = {}
+        db_counts_o = Counter()
         for e in existing_outros:
             key = (_norm(e["cat"]), e["data"], _norm_valor(e["valor"]))
-            outros_exact[key] = e["id"]
+            db_counts_o[key] += 1
 
-        to_insert_outros = []
+        excel_counts_o = Counter()
+        excel_by_key_o = {}
         for o in outros:
             key = (_norm(o["cat"]), o["data"], _norm_valor(o["valor"]))
-            if key in outros_exact:
+            excel_counts_o[key] += 1
+            excel_by_key_o[key] = o
+
+        to_insert_outros = []
+        for key, excel_count in excel_counts_o.items():
+            db_count = db_counts_o.get(key, 0)
+            needed = excel_count - db_count
+            if needed <= 0:
                 continue
-            o["source"] = "excel"
-            to_insert_outros.append(o)
-            # FIX #3: Prevent intra-batch dupes
-            outros_exact[key] = -1
+            o = excel_by_key_o[key]
+            for _ in range(needed):
+                to_insert_outros.append({
+                    "cat": o["cat"],
+                    "data": o["data"],
+                    "valor": o["valor"],
+                    "source": "excel",
+                })
 
         if to_insert_outros:
             r = requests.post(
@@ -607,8 +607,7 @@ def sync_to_supabase(despesas, outros):
 
     # ── SYNC REPORT ──────────────────────────────────────────────────────────
     log.info(f"=== SYNC REPORT: inserted={stats['inserted']}, "
-             f"skipped={stats['skipped']}, renamed={stats['renamed']}, "
-             f"errors={stats['errors']} ===")
+             f"skipped={stats['skipped']}, errors={stats['errors']} ===")
     return stats
 
 # === MAIN ===
