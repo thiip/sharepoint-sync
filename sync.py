@@ -1,5 +1,6 @@
-import os, json, io, time, logging, requests
+import os, json, io, time, logging, requests, unicodedata, re
 from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
 from msal import ConfidentialClientApplication
 from openpyxl import load_workbook
 from openpyxl.styles import Font, Alignment, numbers
@@ -23,6 +24,53 @@ HEADERS_SB = {
     "Authorization": f"Bearer {SUPABASE_KEY}",
     "Content-Type": "application/json",
 }
+
+# === NORMALIZATION ===
+def _strip_accents(s):
+    """Remove accents: Decoração → Decoracao"""
+    nfkd = unicodedata.normalize('NFKD', s)
+    return ''.join(c for c in nfkd if not unicodedata.combining(c))
+
+def _norm(s):
+    """Robust normalization for dedup matching:
+    - strip + uppercase
+    - remove accents
+    - collapse multiple spaces
+    - normalize punctuation (remove hyphens, dots, extra chars)
+    """
+    s = str(s or "").strip().upper()
+    s = _strip_accents(s)
+    s = re.sub(r'[-./]', ' ', s)       # replace punctuation with space
+    s = re.sub(r'\s+', ' ', s).strip()  # collapse multiple spaces
+    return s
+
+def _norm_valor(v):
+    """Normalize numeric value to a deterministic string for comparison.
+    Uses Decimal to avoid float representation issues.
+    """
+    try:
+        d = Decimal(str(v)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        return str(d)
+    except Exception:
+        return str(round(float(v), 2))
+
+# Supplier alias map: map known variant names to canonical form
+SUPPLIER_ALIASES = {
+    "HAVA PRODUTOS": "HAVA PRODUTOS QUIMICOS LTDA",
+    "HAVA PRODUTOS QUIMICOS": "HAVA PRODUTOS QUIMICOS LTDA",
+    "MG MUNK": "MG MUNCK",
+    "CONTAGEMQUIPE": "CONTAGEMQUIP",
+    "CONTAGEMQUIP": "CONTAGEMQUIP",
+    "TELEPAR": "TELEPAR PARAFUSOS",
+    "LT DECORACAO": "LT DECORACOES",
+    "LT DECORACOES": "LT DECORACOES",
+    "LT DECORAÇÕES": "LT DECORACOES",
+}
+
+def _canonical_supplier(name):
+    """Resolve supplier name to canonical form."""
+    normed = _norm(name)
+    return SUPPLIER_ALIASES.get(normed, normed)
 
 # === MICROSOFT GRAPH AUTH ===
 def get_graph_token():
@@ -85,7 +133,6 @@ def read_erp_items():
     deleted_despesas = []
     deleted_outros = []
 
-    # Despesas com source='erp' (novos/editados no ERP)
     resp = requests.get(
         f"{SUPABASE_URL}/rest/v1/despesas?source=eq.erp&select=*",
         headers=HEADERS_SB,
@@ -94,7 +141,6 @@ def read_erp_items():
         despesas = resp.json()
     log.info(f"ERP despesas pendentes: {len(despesas)}")
 
-    # Outros com source='erp'
     resp = requests.get(
         f"{SUPABASE_URL}/rest/v1/outros?source=eq.erp&select=*",
         headers=HEADERS_SB,
@@ -103,7 +149,6 @@ def read_erp_items():
         outros = resp.json()
     log.info(f"ERP outros pendentes: {len(outros)}")
 
-    # Despesas marcadas para deleção
     resp = requests.get(
         f"{SUPABASE_URL}/rest/v1/despesas?source=eq.erp_deleted&select=*",
         headers=HEADERS_SB,
@@ -112,7 +157,6 @@ def read_erp_items():
         deleted_despesas = resp.json()
     log.info(f"ERP despesas deletadas pendentes: {len(deleted_despesas)}")
 
-    # Outros marcados para deleção
     resp = requests.get(
         f"{SUPABASE_URL}/rest/v1/outros?source=eq.erp_deleted&select=*",
         headers=HEADERS_SB,
@@ -148,18 +192,17 @@ def write_to_excel(wb, erp_despesas, erp_outros, deleted_despesas, deleted_outro
                         continue
 
                     try:
-                        valor = float(valor) if valor else 0
+                        valor_f = float(valor) if valor else 0
                     except (ValueError, TypeError):
                         continue
 
                     for dd in deleted_despesas:
-                        if (dd.get("descricao", "") == desc and
+                        if (_norm(dd.get("descricao", "")) == _norm(desc) and
                             dd.get("data", "") == data_str and
-                            abs(float(dd.get("valor", 0)) - valor) < 0.01):
+                            abs(float(dd.get("valor", 0)) - valor_f) < 0.01):
                             rows_to_delete.append(row)
                             break
 
-                # Deletar de baixo pra cima para não bagunçar os índices
                 for row in sorted(rows_to_delete, reverse=True):
                     ws.delete_rows(row)
                     modified = True
@@ -167,7 +210,6 @@ def write_to_excel(wb, erp_despesas, erp_outros, deleted_despesas, deleted_outro
 
             # --- Adicionar novos itens do ERP ---
             if erp_despesas:
-                # Encontrar última linha com dados
                 last_row = ws.max_row
                 for row in range(ws.max_row, 3, -1):
                     if ws.cell(row=row, column=6).value is not None:
@@ -175,7 +217,6 @@ def write_to_excel(wb, erp_despesas, erp_outros, deleted_despesas, deleted_outro
                         break
 
                 for item in erp_despesas:
-                    # Verificar se já existe no Excel (evitar duplicatas)
                     exists = False
                     for row in range(4, last_row + 1):
                         desc = str(ws.cell(row=row, column=2).value or "")
@@ -188,12 +229,12 @@ def write_to_excel(wb, erp_despesas, erp_outros, deleted_despesas, deleted_outro
                         else:
                             continue
                         try:
-                            valor = float(valor) if valor else 0
+                            valor_f = float(valor) if valor else 0
                         except (ValueError, TypeError):
                             continue
-                        if (item.get("descricao", "") == desc and
+                        if (_norm(item.get("descricao", "")) == _norm(desc) and
                             item.get("data", "") == ds and
-                            abs(float(item.get("valor", 0)) - valor) < 0.01):
+                            abs(float(item.get("valor", 0)) - valor_f) < 0.01):
                             exists = True
                             break
 
@@ -202,7 +243,6 @@ def write_to_excel(wb, erp_despesas, erp_outros, deleted_despesas, deleted_outro
                         ws.cell(row=last_row, column=2, value=item.get("descricao", ""))
                         ws.cell(row=last_row, column=3, value=item.get("obs", ""))
 
-                        # Escrever data como datetime para formatação correta no Excel
                         try:
                             dt = datetime.strptime(item["data"], "%Y-%m-%d")
                             cell_d = ws.cell(row=last_row, column=4, value=dt)
@@ -219,7 +259,6 @@ def write_to_excel(wb, erp_despesas, erp_outros, deleted_despesas, deleted_outro
                         log.info(f"  Added to Excel: {item.get('descricao')} - R${item.get('valor')}")
 
         elif "OUTROS" in sheet_name.upper():
-            # Mapear seções: encontrar colunas de cada categoria
             sections = []
             for col in range(1, ws.max_column + 1):
                 val = ws.cell(row=2, column=col).value
@@ -236,7 +275,6 @@ def write_to_excel(wb, erp_despesas, erp_outros, deleted_despesas, deleted_outro
                     if data_col and valor_col:
                         sections.append({"cat": cat_name, "data_col": data_col, "valor_col": valor_col})
 
-            # --- Remover linhas deletadas de OUTROS ---
             if deleted_outros:
                 for section in sections:
                     rows_to_clear = []
@@ -250,27 +288,24 @@ def write_to_excel(wb, erp_despesas, erp_outros, deleted_despesas, deleted_outro
                         else:
                             ds = str(data_cell)[:10]
                         try:
-                            valor = float(valor)
+                            valor_f = float(valor)
                         except (ValueError, TypeError):
                             continue
                         for do in deleted_outros:
                             if (do.get("cat", "") == section["cat"] and
                                 do.get("data", "") == ds and
-                                abs(float(do.get("valor", 0)) - valor) < 0.01):
+                                abs(float(do.get("valor", 0)) - valor_f) < 0.01):
                                 rows_to_clear.append(row)
                                 break
 
-                    # Limpar células (não deletar linhas pois a sheet tem seções lado a lado)
                     for row in rows_to_clear:
                         ws.cell(row=row, column=section["data_col"]).value = None
                         ws.cell(row=row, column=section["valor_col"]).value = None
                         modified = True
                         log.info(f"  Cleared OUTROS row {row} cat={section['cat']}")
 
-            # --- Adicionar novos itens do ERP em OUTROS ---
             if erp_outros:
                 for item in erp_outros:
-                    # Encontrar a seção correta
                     target_section = None
                     for s in sections:
                         if s["cat"] == item.get("cat", ""):
@@ -281,7 +316,6 @@ def write_to_excel(wb, erp_despesas, erp_outros, deleted_despesas, deleted_outro
                         log.warning(f"  Categoria '{item.get('cat')}' não encontrada no Excel OUTROS")
                         continue
 
-                    # Verificar se já existe
                     exists = False
                     last_row = 3
                     for row in range(4, ws.max_row + 1):
@@ -321,7 +355,6 @@ def write_to_excel(wb, erp_despesas, erp_outros, deleted_despesas, deleted_outro
 # === MARK ERP ITEMS AS SYNCED ===
 def mark_erp_items_synced():
     """Marcar itens do ERP como sincronizados (source='synced')"""
-    # Atualizar despesas source='erp' → 'synced'
     resp = requests.patch(
         f"{SUPABASE_URL}/rest/v1/despesas?source=eq.erp",
         headers=HEADERS_SB,
@@ -332,7 +365,6 @@ def mark_erp_items_synced():
     else:
         log.error(f"Erro ao marcar despesas: {resp.status_code}")
 
-    # Atualizar outros source='erp' → 'synced'
     resp = requests.patch(
         f"{SUPABASE_URL}/rest/v1/outros?source=eq.erp",
         headers=HEADERS_SB,
@@ -343,7 +375,6 @@ def mark_erp_items_synced():
     else:
         log.error(f"Erro ao marcar outros: {resp.status_code}")
 
-    # Deletar registros marcados como erp_deleted (já removidos do Excel)
     resp = requests.delete(
         f"{SUPABASE_URL}/rest/v1/despesas?source=eq.erp_deleted",
         headers=HEADERS_SB,
@@ -440,30 +471,36 @@ def parse_excel(content):
     log.info(f"Parsed: {len(despesas)} despesas, {len(outros)} outros")
     return despesas, outros
 
-# === SYNC TO SUPABASE ===
-def _norm(s):
-    """Normalize string for comparison: uppercase + strip whitespace."""
-    return str(s or "").strip().upper()
-
+# === SYNC TO SUPABASE (FIXED) ===
 def sync_to_supabase(despesas, outros):
+    """Idempotent sync: repeated imports NEVER create duplicates.
+
+    Key fixes vs previous version:
+    1. Fetches ALL source types (not just 'excel') for dedup
+    2. Uses Decimal for deterministic float comparison
+    3. Updates exact_map with newly inserted records to prevent intra-batch dupes
+    4. Uses robust normalization (_norm) with accent stripping
+    """
+    stats = {"inserted": 0, "skipped": 0, "renamed": 0, "errors": 0}
+
     # ── DESPESAS ──────────────────────────────────────────────────────────────
     if despesas:
-        # 1. Fetch all existing records
+        # FIX #1: Fetch ALL existing records regardless of source
+        # Previously only checked source='excel', missing 'synced' and 'erp' records
         resp = requests.get(
-            f"{SUPABASE_URL}/rest/v1/despesas?select=id,descricao,data,valor,pago&source=eq.excel",
+            f"{SUPABASE_URL}/rest/v1/despesas?select=id,descricao,data,valor,pago,source"
+            f"&source=neq.erp_deleted",
             headers=HEADERS_SB,
         )
         existing = resp.json() if resp.status_code == 200 else []
 
-        # Build two lookup maps from existing records
-        # exact_map: (desc_norm, data, valor_str, pago_norm) → id
-        # txn_map:   (data, valor_str, pago_norm)            → [id, ...]
+        # Build lookup maps using Decimal for deterministic comparison
         exact_map = {}
         txn_map = {}
         for e in existing:
             desc_n = _norm(e["descricao"])
             pago_n = _norm(e["pago"])
-            v_str  = str(round(float(e["valor"]), 2))
+            v_str  = _norm_valor(e["valor"])  # FIX #2: Decimal-based comparison
             exact_map[(desc_n, e["data"], v_str, pago_n)] = e["id"]
             txn_key = (e["data"], v_str, pago_n)
             txn_map.setdefault(txn_key, []).append(e["id"])
@@ -472,17 +509,15 @@ def sync_to_supabase(despesas, outros):
         for d in despesas:
             desc_n = _norm(d["descricao"])
             pago_n = _norm(d["pago"])
-            v_str  = str(round(float(d["valor"]), 2))
+            v_str  = _norm_valor(d["valor"])
             exact_key = (desc_n, d["data"], v_str, pago_n)
             txn_key   = (d["data"], v_str, pago_n)
 
             if exact_key in exact_map:
-                # Already exists with same normalized name — skip
+                stats["skipped"] += 1
                 continue
 
             if txn_key in txn_map and len(txn_map[txn_key]) == 1:
-                # Same transaction exists but with a different name (capitalisation /
-                # abbreviation changed in the spreadsheet) — rename the existing record
                 existing_id = txn_map[txn_key][0]
                 r = requests.patch(
                     f"{SUPABASE_URL}/rest/v1/despesas?id=eq.{existing_id}",
@@ -491,9 +526,11 @@ def sync_to_supabase(despesas, outros):
                 )
                 if r.status_code < 300:
                     log.info(f"  Renamed ID={existing_id} → {desc_n}")
+                    stats["renamed"] += 1
                 else:
                     log.error(f"  Rename failed ID={existing_id}: {r.status_code}")
-                # Update lookup so a second record with same txn_key isn't double-inserted
+                    stats["errors"] += 1
+                # FIX #3: Update map to prevent intra-batch duplicates
                 exact_map[exact_key] = existing_id
                 continue
 
@@ -503,39 +540,49 @@ def sync_to_supabase(despesas, outros):
             d["source"]    = "excel"
             to_insert.append(d)
 
+            # FIX #3: Register in maps immediately so next iteration sees it
+            exact_map[exact_key] = -1  # placeholder ID
+            txn_map.setdefault(txn_key, []).append(-1)
+
         if to_insert:
             r = requests.post(
                 f"{SUPABASE_URL}/rest/v1/despesas",
                 headers={**HEADERS_SB, "Prefer": "return=minimal"},
                 json=to_insert,
             )
-            log.info(f"Inserted {len(to_insert)} new despesas: {r.status_code}")
-            if r.status_code >= 400:
-                log.error(f"  Error: {r.text[:300]}")
+            if r.status_code < 400:
+                stats["inserted"] += len(to_insert)
+                log.info(f"Inserted {len(to_insert)} new despesas")
+            else:
+                stats["errors"] += len(to_insert)
+                log.error(f"  Insert error: {r.text[:300]}")
         else:
             log.info("Despesas: no new records to insert")
 
     # ── OUTROS ────────────────────────────────────────────────────────────────
     if outros:
+        # FIX #1: Fetch ALL source types for dedup
         resp = requests.get(
-            f"{SUPABASE_URL}/rest/v1/outros?select=id,cat,data,valor",
+            f"{SUPABASE_URL}/rest/v1/outros?select=id,cat,data,valor,source"
+            f"&source=neq.erp_deleted",
             headers=HEADERS_SB,
         )
         existing_outros = resp.json() if resp.status_code == 200 else []
 
-        # exact_map: (cat_norm, data, valor_str) → id
         outros_exact = {}
         for e in existing_outros:
-            key = (_norm(e["cat"]), e["data"], str(round(float(e["valor"]), 2)))
+            key = (_norm(e["cat"]), e["data"], _norm_valor(e["valor"]))
             outros_exact[key] = e["id"]
 
         to_insert_outros = []
         for o in outros:
-            key = (_norm(o["cat"]), o["data"], str(round(float(o["valor"]), 2)))
+            key = (_norm(o["cat"]), o["data"], _norm_valor(o["valor"]))
             if key in outros_exact:
                 continue
             o["source"] = "excel"
             to_insert_outros.append(o)
+            # FIX #3: Prevent intra-batch dupes
+            outros_exact[key] = -1
 
         if to_insert_outros:
             r = requests.post(
@@ -543,11 +590,18 @@ def sync_to_supabase(despesas, outros):
                 headers={**HEADERS_SB, "Prefer": "return=minimal"},
                 json=to_insert_outros,
             )
-            log.info(f"Inserted {len(to_insert_outros)} new outros: {r.status_code}")
-            if r.status_code >= 400:
-                log.error(f"  Error: {r.text[:300]}")
+            if r.status_code < 400:
+                log.info(f"Inserted {len(to_insert_outros)} new outros")
+            else:
+                log.error(f"  Insert error: {r.text[:300]}")
         else:
             log.info("Outros: no new records to insert")
+
+    # ── SYNC REPORT ──────────────────────────────────────────────────────────
+    log.info(f"=== SYNC REPORT: inserted={stats['inserted']}, "
+             f"skipped={stats['skipped']}, renamed={stats['renamed']}, "
+             f"errors={stats['errors']} ===")
+    return stats
 
 # === MAIN ===
 def run_sync():
@@ -574,17 +628,13 @@ def run_sync():
             modified = write_to_excel(wb, erp_despesas, erp_outros, del_despesas, del_outros)
 
             if modified:
-                # Save workbook to bytes
                 output = io.BytesIO()
                 wb.save(output)
                 excel_bytes = output.getvalue()
 
-                # Upload modified Excel back to SharePoint
                 log.info("--- Uploading modified Excel to SharePoint ---")
                 if upload_excel(token, site_id, item_id, excel_bytes):
-                    # Re-download the fresh version for parsing
                     content = excel_bytes
-                    # Mark ERP items as synced
                     mark_erp_items_synced()
                 else:
                     log.error("Upload failed, skipping mark as synced")
