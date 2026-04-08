@@ -67,6 +67,14 @@ SUPPLIER_ALIASES = {
     "LT DECORACOES": "LT DECORACOES",
 }
 
+# Only two companies exist as payers
+def _canonical_payer(p):
+    """Normalize payer name: only 'LT Decoraçoes' or 'Just Smile'."""
+    n = _strip_accents(str(p or "")).strip().lower()
+    if "just" in n or "smile" in n:
+        return "Just Smile"
+    return "LT Decoraçoes"
+
 def _canonical_supplier(name):
     """Resolve supplier name to canonical form."""
     normed = _norm(name)
@@ -419,7 +427,7 @@ def parse_excel(content):
                     "descricao": str(ws.cell(row=row, column=2).value or "").strip().upper(),
                     "obs": str(ws.cell(row=row, column=3).value or "").strip(),
                     "data": data_str,
-                    "pago": str(ws.cell(row=row, column=5).value or "").strip(),
+                    "pago": _canonical_payer(ws.cell(row=row, column=5).value),
                     "valor": valor,
                 })
 
