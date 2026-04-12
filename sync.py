@@ -18,11 +18,15 @@ FILE_PATH = os.environ.get("FILE_PATH", "/Documents/Contabilidade reforma galpã
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://supa.projectum.com.br")
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 SYNC_INTERVAL = int(os.environ.get("SYNC_INTERVAL_MINUTES", "30"))
+SUPABASE_SCHEMA = os.environ.get("SUPABASE_SCHEMA", "galpao")
 
 HEADERS_SB = {
     "apikey": SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}",
     "Content-Type": "application/json",
+    # PostgREST schema routing — read e write precisam do mesmo schema
+    "Accept-Profile": SUPABASE_SCHEMA,
+    "Content-Profile": SUPABASE_SCHEMA,
 }
 
 # === NORMALIZATION ===
